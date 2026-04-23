@@ -1,4 +1,5 @@
-<img width="3840" height="2160" alt="Screenshot from 2026-04-22 18-11-03" src="https://github.com/user-attachments/assets/48b14764-4f87-4e20-a1dd-6e6c1b1e4dca" />
+<img width="3840" height="2160" alt="Screenshot from 2026-04-23 15-00-37" src="https://github.com/user-attachments/assets/77373a2e-99a6-4b47-bbda-807d44eec8b0" />
+
 
 # Music Player
 
