@@ -83,10 +83,12 @@ except ImportError:
 
 logging.basicConfig(
     filename=Path.home() / "music_player.log",
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+DEBUG_MODE = True
 
 AUDIO_FORMATS = {".mp3", ".wav", ".flac", ".m4a", ".m4b", ".m4p", ".mpc", ".ogg", ".oga", ".mogg",
                  ".raw", ".wma", ".wv", ".webm", ".cda", ".3gp", ".aa", ".aac", ".aax",
@@ -129,6 +131,7 @@ class PlayerState:
     current_dir: Optional[str] = None
     current_theme: str = "Matrix"
     song_length_ms: int = 0
+    current_pos_offset: float = 0.0
     play_history: dict = field(default_factory=dict)
     song_weights: dict = field(default_factory=dict)
     sleep_timer_minutes: int = 0
@@ -154,8 +157,12 @@ class MusicPlayerApp:
     SETTINGS_FILE = Path.home() / ".music_player_settings.json"
     HISTORY_FILE = Path.home() / ".music_player_history.json"
 
+    SONG_END_EVENT = 26
+
     def __init__(self):
+        pygame.init()
         pygame.mixer.init()
+        pygame.mixer.music.set_endevent(self.SONG_END_EVENT)
         self.state = PlayerState()
         self.ui_elements = {}
         self.tray = None
@@ -165,6 +172,9 @@ class MusicPlayerApp:
         self.current_album_art = None
         self.album_image_label = None
         self.visualizer_bars = []
+        self._song_ended_pending = False
+        self._is_loading = False
+        self._lock = threading.Lock()
 
         self.root = tk.Tk()
         self.root.title(self.APP_NAME)
@@ -417,27 +427,53 @@ class MusicPlayerApp:
         return audio_segment._spawn(stereo.tobytes())
 
     def play_song(self, song_path: str):
-        try:
-            self.state.current_song = song_path
-            self.state.prev_songs.append(song_path)
-            self.state.song_count += 1
-            self.state.song_length_ms = self.get_song_duration(song_path)
-            self.state.play_history[song_path] = self.state.play_history.get(song_path, 0) + 1
-            self.save_history()
+        logger.info(f"play_song called: {song_path}, is_loading={self._is_loading}")
+        if self._is_loading:
+            logger.warning("play_song: already loading, returning")
+            return
+        
+        if not song_path or not os.path.exists(song_path):
+            logger.error(f"play_song: file not found: {song_path}")
+            self.set_error("File not found")
+            return
 
-            self.update_playing_label(song_path)
-            self.set_status(f"Loading: {Path(song_path).stem}...")
+        with self._lock:
+            self._is_loading = True
+            try:
+                logger.info("play_song: stopping mixer")
+                pygame.mixer.music.stop()
+                try:
+                    pygame.mixer.music.unload()
+                except Exception as e:
+                    logger.warning(f"play_song: unload error: {e}")
+                
+                self.state.current_song = song_path
+                self.state.prev_songs.append(song_path)
+                self.state.song_count += 1
+                self.state.song_length_ms = self.get_song_duration(song_path)
+                self.state.current_pos_offset = 0.0
+                self.state.play_history[song_path] = self.state.play_history.get(song_path, 0) + 1
+                self.save_history()
 
-            if PYDUB_AVAILABLE and SCIPY_AVAILABLE and self.state.eq_preset != "Flat":
-                threading.Thread(target=self._play_with_eq, args=(song_path,), daemon=True).start()
-            else:
-                pygame.mixer.music.load(song_path)
-                pygame.mixer.music.play()
-                self._finish_song_setup(song_path)
+                self.update_playing_label(song_path)
+                self.set_status(f"Loading: {Path(song_path).stem}...")
 
-        except Exception as e:
-            logger.error(f"Play error: {e}")
-            self.set_error(f"Error: {e}")
+                if PYDUB_AVAILABLE and SCIPY_AVAILABLE and self.state.eq_preset != "Flat":
+                    logger.info("play_song: starting EQ thread")
+                    threading.Thread(target=self._play_with_eq, args=(song_path,), daemon=True).start()
+                else:
+                    logger.info(f"play_song: loading directly: {song_path}")
+                    pygame.mixer.music.load(song_path)
+                    pygame.mixer.music.play()
+                    self._finish_song_setup(song_path)
+
+            except Exception as e:
+                logger.error(f"play_song EXCEPTION: {e}", exc_info=True)
+                self.set_error(f"Error: {e}")
+            finally:
+                self._is_loading = False
+                logger.info("play_song: finished, is_loading=False")
+                self._is_loading = False
 
     def _play_with_eq(self, song_path):
         try:
@@ -461,9 +497,10 @@ class MusicPlayerApp:
         self.root.title(title_str)
         self.save_settings()
         self.set_status(f"Playing: {Path(song_path).stem}")
-        self._update_progress_bar(0)
+        self._draw_progress_bar(0)
         self._update_tray_tooltip()
         self._update_visualizer()
+        self._is_loading = False
 
         lb = self.ui_elements["playlist"]
         try:
@@ -475,11 +512,13 @@ class MusicPlayerApp:
             pass
 
     def skip_song(self):
+        logger.info(f"skip_song called, playlist_len={len(self.state.playlist) if self.state.playlist else 0}")
         current_time = pygame.mixer.music.get_pos() / 1000
         if self.state.current_song and current_time < 10:
             self.state.song_weights[self.state.current_song] = self.state.song_weights.get(self.state.current_song, 1.0) * 0.8
 
         if not self.state.playlist or self.state.is_paused:
+            logger.warning(f"skip_song: no playlist or paused, returning")
             return
         playlist = self.state.playlist
         if self.state.playlist_only_mode and playlist:
@@ -498,8 +537,10 @@ class MusicPlayerApp:
             weights = [self.state.song_weights.get(s, 1.0) for s in playlist]
             song = random.choices(playlist, weights=weights, k=1)[0]
         else:
+            logger.warning(f"skip_song: no song found")
             return
         self.state.skip_count += 1
+        logger.info(f"skip_song: calling play_song with: {song}")
         self.play_song(song)
 
     def prev_song(self):
@@ -521,6 +562,20 @@ class MusicPlayerApp:
             self.ui_elements["pause_btn"].config(text="Pause", fg=self._theme()["btn_fg"])
             self.set_status("Playing")
             self._update_tray_tooltip()
+
+    def skip_forward(self):
+        if self.state.current_song and not self.state.is_paused:
+            current_pos = pygame.mixer.music.get_pos()
+            if current_pos >= 0:
+                new_pos = (current_pos / 1000) + 10
+                pygame.mixer.music.set_pos(new_pos)
+
+    def skip_backward(self):
+        if self.state.current_song and not self.state.is_paused:
+            current_pos = pygame.mixer.music.get_pos()
+            if current_pos >= 0:
+                new_pos = (current_pos / 1000) - 10
+                pygame.mixer.music.set_pos(max(0, new_pos))
 
     def toggle_pause(self):
         if self.state.is_paused:
@@ -809,8 +864,9 @@ EQ      : Equalizer presets"""
     def play_selected(self, event):
         idx = self.ui_elements["playlist"].curselection()
         if idx:
-            song = self.ui_elements["playlist"].get(idx[0])
-            self.play_song(song)
+            song = self.state.playlist[idx[0]] if idx[0] < len(self.state.playlist) else None
+            if song:
+                self.play_song(song)
 
     def update_album_art(self, song_path: str):
         if not PIL_AVAILABLE or not self.album_image_label:
@@ -886,22 +942,6 @@ EQ      : Equalizer presets"""
                 display = f"{folder} - {name}"
                 lb.insert(tk.END, display)
 
-    def play_selected(self, event):
-        idx = self.ui_elements["playlist"].curselection()
-        if idx:
-            display_text = self.ui_elements["playlist"].get(idx[0])
-            try:
-                folder_name, song_name = display_text.split(" - ", 1)
-                song_name = song_name.strip()
-                for song in self.state.playlist:
-                    if Path(song).stem == song_name:
-                        self.play_song(song)
-                        break
-            except:
-                song = self.state.playlist[idx[0]] if idx[0] < len(self.state.playlist) else None
-                if song:
-                    self.play_song(song)
-
     def set_status(self, text: str):
         lb = self.ui_elements["playlist"]
         try:
@@ -928,42 +968,105 @@ EQ      : Equalizer presets"""
             running = datetime.datetime.now() - self.state.start_time
             info = f"Songs: {self.state.song_count} | Skips: {self.state.skip_count} | {running}"
             self.ui_elements["info"].config(text=info)
-        if not pygame.mixer.music.get_busy() and self.state.current_song and not self.state.is_paused and not self.skip_cooldown:
-            if self.state.repeat_enabled:
-                self.play_song(self.state.current_song)
-            else:
-                self.skip_cooldown = True
-                self.skip_song()
-                self.root.after(500, lambda: setattr(self, 'skip_cooldown', False))
-        self._update_progress_from_mixer()
-        self._update_visualizer()
+
+        if not self._is_loading:
+            self._update_progress_from_mixer()
+            self._update_visualizer()
+
+        if self._song_ended_pending:
+            logger.debug("_update_labels: song_ended_pending=True, returning")
+            return
+
+        if self._is_loading or self.state.is_paused or not self.state.current_song:
+            return
+
+        busy = pygame.mixer.music.get_busy()
+        logger.debug(f"_update_labels: busy={busy}, current_song={self.state.current_song is not None}")
+        
+        if not busy and self.state.current_song:
+            logger.info("_update_labels: mixer not busy, calling _handle_song_end")
+            self._song_ended_pending = True
+            self._handle_song_end()
 
     def _update_progress_from_mixer(self):
-        if self.state.song_length_ms > 0 and not self.state.is_paused and not self.progress_dragging:
-            pos = pygame.mixer.music.get_pos()
-            if pos >= 0:
-                progress = (pos / self.state.song_length_ms) * 100
-                if "progress" in self.ui_elements:
-                    self.ui_elements["progress"].config(value=min(progress, 100))
-                current_sec = int(pos / 1000)
-                total_sec = int(self.state.song_length_ms / 1000)
-                if "progress_label" in self.ui_elements:
-                    self.ui_elements["progress_label"].config(text=f"{current_sec//60}:{current_sec%60:02d}")
-                if "progress_end" in self.ui_elements:
-                    self.ui_elements["progress_end"].config(text=f"{total_sec//60}:{total_sec%60:02d}")
+        if self.state.is_paused or self.state.song_length_ms <= 0:
+            return
+
+        raw_ms = pygame.mixer.music.get_pos()
+        if raw_ms < 0:
+            return
+
+        current_sec = int(raw_ms / 1000)
+        total_sec = int(self.state.song_length_ms / 1000)
+        
+        self.ui_elements["progress_label"].config(text=f"{current_sec//60}:{current_sec%60:02d}")
+        self.ui_elements["progress_end"].config(text=f"{total_sec//60}:{total_sec%60:02d}")
+        
+        percent = (raw_ms / self.state.song_length_ms) * 100
+        self._draw_progress_bar(min(100, percent))
+
+    def _handle_song_end(self):
+        logger.info(f"_handle_song_end: pending={self._song_ended_pending}, repeat={self.state.repeat_enabled}")
+        if not self._song_ended_pending:
+            return
+
+        self._song_ended_pending = False
+
+        if self.state.repeat_enabled and self.state.current_song:
+            logger.info("_handle_song_end: repeating current song")
+            self.play_song(self.state.current_song)
+        else:
+            logger.info("_handle_song_end: skipping to next")
+            self.skip_song()
+
+    pass
+
+    def _draw_progress_bar(self, percent):
+        canvas = self.ui_elements.get("progress")
+        if not canvas:
+            return
+        t = self._theme()
+        canvas.delete("all")
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w <= 0 or h <= 0:
+            return
+        fill = int((percent / 100.0) * w)
+        canvas.create_rectangle(0, 0, fill, h, fill=t["accent"], outline="")
+        canvas.create_rectangle(fill, 0, w, h, fill=t["highlight"], outline="")
+        self.ui_elements["progress_current"] = percent
 
     def _update_progress_bar(self, value):
         if "progress" in self.ui_elements:
             self.ui_elements["progress"].config(value=value)
 
     def _scrub_audio(self, event):
-        if self.state.song_length_ms > 0:
-            width = self.ui_elements["progress"].winfo_width()
-            if width > 0:
-                percentage = event.x / width
-                target_ms = int(percentage * self.state.song_length_ms)
-                pygame.mixer.music.set_pos(target_ms / 1000)
-                self.ui_elements["progress"].config(value=percentage * 100)
+        if self.state.song_length_ms <= 0 or not self.state.current_song or self.state.is_paused:
+            return
+        canvas = self.ui_elements.get("progress")
+        if not canvas:
+            return
+        width = canvas.winfo_width()
+        if width > 0:
+            pct = max(0, min(1, event.x / width))
+            target = pct * self.state.song_length_ms / 1000.0
+            try:
+                pygame.mixer.music.set_pos(float(target))
+            except Exception as e:
+                print(f"Seek error: {e}")
+
+    def _on_progress_release(self, event):
+        self._scrub_audio(event)
+
+    def _on_progress_scroll(self, event):
+        if self.state.song_length_ms > 0 and self.state.current_song and not self.state.is_paused:
+            current_pos = pygame.mixer.music.get_pos() / 1000
+            if hasattr(event, 'delta') and event.delta > 0 or event.num == 4:
+                new_pos = current_pos + 10
+            else:
+                new_pos = current_pos - 10
+            new_pos = max(0, min(self.state.song_length_ms / 1000, new_pos))
+            pygame.mixer.music.set_pos(new_pos)
 
     def _update_visualizer(self):
         if not self.visualizer_bars:
@@ -987,6 +1090,10 @@ EQ      : Equalizer presets"""
         self.root.bind("<space>", lambda e: self.toggle_pause())
         self.root.bind("<Right>", lambda e: self.skip_song())
         self.root.bind("<Left>", lambda e: self.prev_song())
+        self.root.bind("<Shift-Right>", lambda e: self.skip_forward())
+        self.root.bind("<Shift-Left>", lambda e: self.skip_backward())
+        self.root.bind("<Up>", lambda e: self.increase_volume())
+        self.root.bind("<Down>", lambda e: self.decrease_volume())
         self.root.bind("<plus>", lambda e: self.increase_volume())
         self.root.bind("<KP_Add>", lambda e: self.increase_volume())
         self.root.bind("<minus>", lambda e: self.decrease_volume())
@@ -1169,9 +1276,17 @@ EQ      : Equalizer presets"""
         progress_frame.pack(fill=tk.X, pady=5)
         self.ui_elements["progress_label"] = tk.Label(progress_frame, text="0:00", bg=bg, fg=fg, font=font_small)
         self.ui_elements["progress_label"].pack(side=tk.LEFT)
-        self.ui_elements["progress"] = ttk.Scale(progress_frame, from_=0, to=100, length=500, orient=tk.HORIZONTAL)
+
+        tk.Button(progress_frame, text="<<", command=self.skip_backward, bg=btn_bg, fg=fg, font=font_btn, width=3).pack(side=tk.LEFT, padx=2)
+        
+        self.ui_elements["progress"] = tk.Canvas(progress_frame, height=20, bg=t["highlight"], highlightthickness=0, width=500)
+        self.ui_elements["progress"].pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         self.ui_elements["progress"].bind("<Button-1>", self._scrub_audio)
-        self.ui_elements["progress"].pack(side=tk.LEFT, padx=5)
+        self.ui_elements["progress"].bind("<ButtonRelease-1>", self._scrub_audio)
+        self.ui_elements["progress_current"] = 0
+        
+        tk.Button(progress_frame, text=">>", command=self.skip_forward, bg=btn_bg, fg=fg, font=font_btn, width=3).pack(side=tk.LEFT, padx=2)
+
         self.ui_elements["progress_end"] = tk.Label(progress_frame, text="0:00", bg=bg, fg=fg, font=font_small)
         self.ui_elements["progress_end"].pack(side=tk.LEFT)
 
