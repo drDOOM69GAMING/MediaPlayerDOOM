@@ -437,6 +437,8 @@ class MusicPlayerApp:
             self.set_error("File not found")
             return
 
+        pygame.event.clear(self.SONG_END_EVENT)
+
         with self._lock:
             self._is_loading = True
             try:
@@ -498,6 +500,7 @@ class MusicPlayerApp:
         self.save_settings()
         self.set_status(f"Playing: {Path(song_path).stem}")
         self._draw_progress_bar(0)
+        self._update_progress_from_mixer()
         self._update_tray_tooltip()
         self._update_visualizer()
         self._is_loading = False
@@ -1010,6 +1013,13 @@ EQ      : Equalizer presets"""
         if not self._song_ended_pending:
             return
 
+        now = datetime.datetime.now()
+        last_skip = getattr(self, '_last_skip_time', datetime.datetime.min)
+        if (now - last_skip).total_seconds() < 1.5:
+            logger.info("_handle_song_end: within cooldown, returning")
+            return
+
+        self._last_skip_time = now
         self._song_ended_pending = False
 
         if self.state.repeat_enabled and self.state.current_song:
@@ -1365,7 +1375,7 @@ EQ      : Equalizer presets"""
 
         self.ui_elements["error"] = tk.Label(self.root, text="", bg=bg, fg="yellow", font=font_ui)
         self.ui_elements["error"].pack(pady=2)
-        tk.Label(self.root, text="Close window minimizes to tray", bg=bg, fg="#444", font=font_small).pack(pady=2)
+        tk.Button(self.root, text="Exit", command=self.on_close, bg=btn_bg, fg="red", font=font_btn).pack(pady=2)
 
 
 def main():
